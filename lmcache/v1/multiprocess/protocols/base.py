@@ -59,6 +59,8 @@ class RequestType(enum.Enum):
     CLEAR = enum.auto()
     GET_CHUNK_SIZE = enum.auto()
     PING = enum.auto()
+    PIN = enum.auto()
+    UNPIN = enum.auto()
 
     # Observability operations
     REPORT_BLOCK_ALLOCATION = enum.auto()

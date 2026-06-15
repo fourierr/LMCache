@@ -184,6 +184,10 @@ class L1Manager:
 
         self._objects: dict[ObjectKey, L1ObjectState] = {}
 
+        # Permanent pin reference counting: key -> refcount.
+        # Keys with refcount > 0 are never evictable.
+        self._permanent_pins: dict[ObjectKey, int] = {}
+
         self._memory_manager = L1MemoryManager(config.memory_config)
 
         self._write_ttl_seconds = config.write_ttl_seconds
@@ -671,6 +675,10 @@ class L1Manager:
                 ret[key] = L1Error.KEY_NOT_EXIST
                 continue
 
+            if self._permanent_pins.get(key, 0) > 0:
+                ret[key] = L1Error.KEY_IS_LOCKED
+                continue
+
             if entry.read_lock.is_locked() or entry.write_lock.is_locked():
                 ret[key] = L1Error.KEY_IS_LOCKED
                 continue
@@ -702,6 +710,62 @@ class L1Manager:
             listener.on_l1_keys_accessed(keys)
 
     @l1_mgr_synchronized
+    def permanent_pin(self, keys: list[ObjectKey]) -> int:
+        """Permanently pin keys in L1, preventing eviction forever.
+
+        Only keys that already exist in L1 can be pinned.  Each call
+        increments a reference count — the key is protected as long
+        as the count is > 0.  Call :meth:`permanent_unpin` with the
+        same key to release one reference.
+
+        Pinned keys are excluded from eviction in two places:
+        1. :meth:`is_key_evictable` returns ``False`` for them, so the
+           eviction controller never selects them as victims.
+        2. :meth:`delete` rejects permanently pinned keys with
+           ``L1Error.KEY_IS_LOCKED``.
+
+        Prefix semantics: stops at the first key that does not exist
+        in L1 (the caller is expected to pass keys in prefix order).
+
+        Args:
+            keys: Object keys to pin (in prefix order).
+
+        Returns:
+            Number of keys successfully pinned.
+        """
+        hit_count = 0
+        for key in keys:
+            if key not in self._objects:
+                break
+            self._permanent_pins[key] = self._permanent_pins.get(key, 0) + 1
+            hit_count += 1
+        if hit_count:
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_READ_RESERVED,
+                    metadata={"keys": keys[:hit_count]},
+                )
+            )
+        return hit_count
+
+    @l1_mgr_synchronized
+    def permanent_unpin(self, keys: list[ObjectKey]) -> None:
+        """Release one permanent pin reference for each key.
+
+        When the reference count reaches 0 the key becomes eligible
+        for eviction again.  Keys not in the permanent pin table
+        are silently ignored (idempotent).
+
+        Args:
+            keys: Object keys to unpin.
+        """
+        for key in keys:
+            if key in self._permanent_pins:
+                self._permanent_pins[key] -= 1
+                if self._permanent_pins[key] <= 0:
+                    del self._permanent_pins[key]
+
+    @l1_mgr_synchronized
     def clear(self, force: bool = False) -> None:
         """Clear objects from L1 cache.
 
@@ -714,7 +778,7 @@ class L1Manager:
         if force:
             logger.warning(
                 "L1Manager: force-clearing all %d objects "
-                "(including locked ones). This may corrupt in-flight "
+                "(including locked/pinned ones). This may corrupt in-flight "
                 "store/prefetch operations — use with caution.",
                 len(self._objects),
             )
@@ -722,6 +786,7 @@ class L1Manager:
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
             self._memory_manager.free(all_memory_objs)
             self._objects.clear()
+            self._permanent_pins.clear()
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
             self._event_bus.publish(
@@ -739,8 +804,12 @@ class L1Manager:
         keys_to_clear: list[ObjectKey] = []
         objs_to_free: list[MemoryObj] = []
         locked_count = 0
+        pinned_count = 0
 
         for key, entry in list(self._objects.items()):
+            if self._permanent_pins.get(key, 0) > 0:
+                pinned_count += 1
+                continue
             if entry.write_lock.is_locked() or entry.read_lock.is_locked():
                 locked_count += 1
                 continue
@@ -763,13 +832,20 @@ class L1Manager:
             )
 
         logger.info(
-            "L1Manager: cleared %d objects, %d locked objects remaining.",
+            "L1Manager: cleared %d objects, %d pinned objects skipped, "
+            "%d locked objects remaining.",
             len(keys_to_clear),
+            pinned_count,
             locked_count,
         )
 
     def is_key_evictable(self, key: ObjectKey) -> bool:
-        """Check if a key is eligible for eviction (not locked).
+        """Check if a key is eligible for eviction (not locked and not pinned).
+
+        A key is NOT evictable if:
+        - It does not exist in L1, or
+        - It is permanently pinned (``_permanent_pins`` refcount > 0), or
+        - It has an active read lock or write lock.
 
         This method does NOT acquire the global L1Manager lock.
         L1Manager.delete() will check again and safely reject a key
@@ -779,11 +855,12 @@ class L1Manager:
             key: The object key to check.
 
         Returns:
-            True if the key exists and is not locked (neither read-locked
-            nor write-locked), False otherwise.
+            True if the key exists and is evictable, False otherwise.
         """
         entry = self._objects.get(key, None)
         if entry is None:
+            return False
+        if self._permanent_pins.get(key, 0) > 0:
             return False
         return not entry.read_lock.is_locked() and not entry.write_lock.is_locked()
 
@@ -809,6 +886,7 @@ class L1Manager:
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
             self._memory_manager.free(all_memory_objs)
             self._objects.clear()
+            self._permanent_pins.clear()
 
         self._memory_manager.close()
 
@@ -830,6 +908,7 @@ class L1Manager:
         return {
             "is_healthy": self._memory_manager.memcheck(),
             "total_object_count": len(self._objects),
+            "permanent_pin_count": len(self._permanent_pins),
             "write_locked_count": write_locked,
             "read_locked_count": read_locked,
             "temporary_count": temporary,

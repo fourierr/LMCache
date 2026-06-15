@@ -641,6 +641,41 @@ class StorageManager:
                 totals[salt] = totals.get(salt, 0) + used
         return totals
 
+    def pin(self, keys: list[ObjectKey]) -> int:
+        """Permanently pin keys in L1, preventing eviction forever.
+
+        Uses a reference-counted permanent pin table in L1Manager.
+        Keys with an active pin are excluded from eviction — neither
+        the LRU eviction controller nor explicit ``delete()`` calls
+        will remove them.
+
+        Unlike the earlier TTL-based ``reserve_read`` approach, this
+        pin has no timeout.  Call :meth:`unpin` with the same keys to
+        release the reference and make them evictable again.
+
+        Prefix semantics: stops at the first key that does not exist
+        in L1 (the caller is expected to pass keys in prefix order).
+
+        Args:
+            keys: Object keys to pin (in prefix order).
+
+        Returns:
+            Number of keys successfully pinned.
+        """
+        return self._l1_manager.permanent_pin(keys)
+
+    def unpin(self, keys: list[ObjectKey]) -> None:
+        """Release one permanent pin reference for each key.
+
+        When the reference count reaches 0 the key becomes eligible
+        for eviction again.  Keys not in the permanent pin table
+        are silently ignored (idempotent).
+
+        Args:
+            keys: Object keys to unpin.
+        """
+        self._l1_manager.permanent_unpin(keys)
+
     def clear(self, force: bool = False):
         """
         Clear data in the storage manager.

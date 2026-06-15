@@ -8,6 +8,7 @@ This module defines the protocol for:
 """
 
 # First Party
+from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
 
 # Define request names for this protocol group
@@ -15,6 +16,8 @@ REQUEST_NAMES = [
     "CLEAR",
     "GET_CHUNK_SIZE",
     "PING",
+    "PIN",
+    "UNPIN",
 ]
 
 
@@ -48,6 +51,23 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "PING": ProtocolDefinition(
             payload_classes=[],
             response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Pin tokens to prevent eviction
+        # Payload: (IPCCacheEngineKey, str) - (key, location)
+        #   key carries model_name, world_size, worker_id, token_ids, cache_salt
+        # Returns: int - Number of tokens pinned
+        "PIN": ProtocolDefinition(
+            payload_classes=[IPCCacheEngineKey, str],
+            response_class=int,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Unpin tokens to allow eviction
+        # Payload: (IPCCacheEngineKey, str) - (key, location)
+        # Returns: None
+        "UNPIN": ProtocolDefinition(
+            payload_classes=[IPCCacheEngineKey, str],
+            response_class=None,
             handler_type=HandlerType.BLOCKING,
         ),
     }

@@ -209,6 +209,7 @@ class PickleTransferStrategy(TransferStrategy):
             ``True`` when every reserved object is written successfully.
         """
         obj_keys = resolve_obj_keys(key)
+        print(f"store: ipc_key={key}, obj_keys={obj_keys}")
         chunks: list[torch.Tensor] = pickle.loads(cpu_data)
         reserved_dict = self._storage_manager.reserve_write(
             obj_keys, context.layout_desc, "new"
@@ -230,6 +231,7 @@ class PickleTransferStrategy(TransferStrategy):
                 written_keys.append(obj_key)
         finally:
             if written_keys:
+                print(f"44444444444444finish_write={written_keys}")
                 self._storage_manager.finish_write(written_keys)
 
         return len(written_keys) == len(reserved_dict)
@@ -381,11 +383,14 @@ class ShmTransferStrategy(TransferStrategy):
                 resolve_obj_keys=resolve_obj_keys,
             )
         transfer_key = self._transfer_key_factory(key, instance_id)
+        obj_keys = resolve_obj_keys(key)
+        print(f"store (shm): ipc_key={key}, obj_keys={obj_keys}")
         with self._pending_lock:
             reserved_keys = self._pending_writes.pop(transfer_key, None)
         if reserved_keys is None:
             return False
         if reserved_keys:
+            print(f"555555555finish_write={written_keys}")
             self._storage_manager.finish_write(reserved_keys)
         return True
 
