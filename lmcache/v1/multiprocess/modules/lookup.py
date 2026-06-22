@@ -139,6 +139,8 @@ class LookupModule:
                 self.end_session,
                 ThreadPoolType.NORMAL,
             ),
+            HandlerSpec(RequestType.PIN, self.pin, ThreadPoolType.NORMAL),
+            HandlerSpec(RequestType.UNPIN, self.unpin, ThreadPoolType.NORMAL),
         ]
 
     def report_status(self) -> dict[str, int]:
@@ -215,7 +217,10 @@ class LookupModule:
 
         extra_count = compute_extra_count(tp_size, world_size)
 
-        chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids))
+        if key.chunk_hashes:
+            chunk_hashes = list(key.chunk_hashes)
+        else:
+            chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids))
         if not chunk_hashes:
             self._register_prefetch_job(
                 _PrefetchJob(
@@ -263,7 +268,8 @@ class LookupModule:
             )
 
         session = self._ctx.session_manager.get_or_create(key.request_id)
-        session.set_tokens(list(key.token_ids))
+        if not key.chunk_hashes:
+            session.set_tokens(list(key.token_ids))
         session.lookup_ipc_key = key
 
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
@@ -394,9 +400,12 @@ class LookupModule:
             tp_size: Tensor-parallel size for MLA
                 multi-reader locking.
         """
-        chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
-            list(key.token_ids), start=key.start, end=key.end
-        )
+        if key.chunk_hashes:
+            chunk_hashes = list(key.chunk_hashes)
+        else:
+            chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
+                list(key.token_ids), start=key.start, end=key.end
+            )
         if not chunk_hashes:
             return
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
@@ -436,7 +445,12 @@ class LookupModule:
             )
             return
 
-        chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
+        if session.lookup_ipc_key.chunk_hashes:
+            chunk_hashes = list(session.lookup_ipc_key.chunk_hashes)
+        else:
+            chunk_hashes = [
+                TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)
+            ]
         obj_keys = ipc_key_to_object_keys(session.lookup_ipc_key, chunk_hashes)
         # unified touch of all keys, which include retrieved and stored keys
         # TODO(chunxiaozheng): when l2 is enabled, the prefetched keys from l2 are temp
@@ -465,3 +479,59 @@ class LookupModule:
             "Number of active prefetch jobs",
             self._active_prefetch_count,
         )
+
+    def pin(self, key: IPCCacheEngineKey, location: str) -> int:
+        """Permanently pin tokens to prevent KV cache eviction from L1.
+
+        Computes rolling prefix hashes for the full token range and uses a
+        reference-counted permanent pin table in L1Manager.  Pinned keys are
+        excluded from LRU eviction — they will never be evicted unless
+        explicitly unpinned via :meth:`unpin`.
+
+        Unlike TTL-based approaches, this pin has NO timeout.  Call
+        :meth:`unpin` with the same key to release.
+
+        Args:
+            key: IPC cache key carrying model_name, world_size, worker_id,
+                token_ids, cache_salt, and request_id.
+            location: Storage tier location (reserved, currently unused
+                in MP mode; pinning always targets L1).
+
+        Returns:
+            Number of tokens whose KV cache chunks were successfully pinned.
+        """
+        if key.chunk_hashes:
+            chunk_hashes = list(key.chunk_hashes)
+        else:
+            chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
+                list(key.token_ids)
+            )
+        if not chunk_hashes:
+            return 0
+
+        obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
+        hit_chunks = self._ctx.storage_manager.pin(obj_keys)
+        return hit_chunks * self._ctx.chunk_size
+
+    def unpin(self, key: IPCCacheEngineKey, location: str) -> None:
+        """Release permanent pin references, allowing eviction again.
+
+        Computes chunk hashes and releases one permanent pin reference for
+        each key.  When the reference count reaches 0 the key becomes
+        eligible for LRU eviction again.
+
+        Args:
+            key: IPC cache key identical to the one used in :meth:`pin`.
+            location: Storage tier location (reserved, currently unused).
+        """
+        if key.chunk_hashes:
+            chunk_hashes = list(key.chunk_hashes)
+        else:
+            chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
+                list(key.token_ids)
+            )
+        if not chunk_hashes:
+            return
+
+        obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
+        self._ctx.storage_manager.unpin(obj_keys)

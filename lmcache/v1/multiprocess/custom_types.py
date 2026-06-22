@@ -255,6 +255,11 @@ class IPCCacheEngineKey:
     # ObjectKey.cache_salt). Validated in __post_init__.
     cache_salt: str = ""
 
+    # === Hash-mode cache key (optional, for block-hash-based lookups) ===
+    # When set, the server skips token-hasher computation and uses these
+    # pre-computed chunk hashes directly.
+    chunk_hashes: tuple[bytes, ...] = ()
+
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheEngineKey).
     _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
@@ -295,6 +300,7 @@ class IPCCacheEngineKey:
             end=end,
             request_id=request_id,
             cache_salt=cache_salt,
+            chunk_hashes=(),
         )
 
     def no_worker_id_version(self) -> "IPCCacheEngineKey":
@@ -308,6 +314,7 @@ class IPCCacheEngineKey:
             end=self.end,
             request_id=self.request_id,
             cache_salt=self.cache_salt,
+            chunk_hashes=self.chunk_hashes,
         )
 
 

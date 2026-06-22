@@ -198,10 +198,13 @@ class MPCacheEngineContext:
             ValueError: If ``key.worker_id`` is ``None``.
         """
         session = self.session_manager.get_or_create(key.request_id)
-        session.set_tokens(list(key.token_ids))
-        chunk_hashes = [
-            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
-        ]
+        if key.chunk_hashes:
+            chunk_hashes = list(key.chunk_hashes)
+        else:
+            session.set_tokens(list(key.token_ids))
+            chunk_hashes = [
+                TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
+            ]
         if key.worker_id is None:
             raise ValueError("Must resolve keys with worker_id != None")
         return ipc_key_to_object_keys(key, chunk_hashes)

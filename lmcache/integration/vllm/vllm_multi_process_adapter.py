@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 from dataclasses import dataclass
-from typing import Any, Callable, NoReturn, Protocol
+from itertools import islice
+from typing import Any, Callable, Iterable, NoReturn, Protocol
 import enum
 import os
 import threading
@@ -31,6 +32,20 @@ from lmcache.v1.multiprocess.transfer_context import (
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
 
 logger = init_logger(__name__)
+
+
+def striding_block_hashes(
+    block_hashes: list[bytes], blocks_in_chunk: int
+) -> Iterable[bytes]:
+    """Extract chunk-level hashes from block hashes by striding.
+
+    In hash-based vLLM, each vLLM block has its own hash.  LMCache chunks
+    span ``blocks_in_chunk`` consecutive blocks.  The representative hash
+    for a chunk is the hash of the **last** block in that chunk (because
+    each block hash already encodes its prefix).  So we start at index
+    ``blocks_in_chunk - 1`` and stride by ``blocks_in_chunk``.
+    """
+    return islice(block_hashes, blocks_in_chunk - 1, None, blocks_in_chunk)
 
 
 class ExtraConfigDefault(enum.Enum):
@@ -403,6 +418,11 @@ class LoadStoreOp:
     block_ids: list[int]
     """Block ids for the load/store operation"""
 
+    block_hashes: list[bytes] | None = None
+    """Block hashes for hash-mode load/store operation.
+    When set, token_ids may be empty and the server uses these hashes
+    directly instead of computing them from token_ids."""
+
     start: int = 0
     """Start token index"""
 
@@ -537,7 +557,8 @@ class LMCacheMPSchedulerAdapter:
     def maybe_submit_lookup_request(
         self,
         request_id: str,
-        token_ids: list[int],
+        token_ids: list[int] | None = None,
+        block_hashes: list[bytes] | None = None,
         cache_salt: str = "",
     ):
         """
@@ -550,7 +571,9 @@ class LMCacheMPSchedulerAdapter:
         Args:
             request_id: The ID of the lookup request. The same ID indicates it's
                 from the same request
-            token_ids: Token IDs to lookup from LMCache
+            token_ids: Token IDs to lookup from LMCache (token mode).
+            block_hashes: Block hashes to lookup from LMCache (hash mode).
+                Exactly one of token_ids or block_hashes must be provided.
             cache_salt: Per-user isolation salt. Requests with different
                 cache_salt values produce separate cache entries.
 
@@ -573,15 +596,34 @@ class LMCacheMPSchedulerAdapter:
             # Skip if there is already a lookup request
             return
 
-        aligned_end = (len(token_ids) // self.chunk_size) * self.chunk_size
+        assert (token_ids is None) != (block_hashes is None), (
+            "Exactly one of token_ids or block_hashes must be provided"
+        )
 
-        key = self._create_key(
-            token_ids,
-            start=0,
-            end=aligned_end,
-            request_id=request_id,
-            cache_salt=cache_salt,
-        ).no_worker_id_version()
+        if block_hashes is not None:
+            # Hash mode: compute chunk hashes and build a hash-mode key
+            chunk_hashes = tuple(
+                striding_block_hashes(block_hashes, self.blocks_in_chunk)
+            )
+            if not chunk_hashes:
+                return
+            key = self._create_hash_key(
+                chunk_hashes,
+                request_id=request_id,
+                cache_salt=cache_salt,
+            ).no_worker_id_version()
+        else:
+            assert token_ids is not None
+            aligned_end = (len(token_ids) // self.chunk_size) * self.chunk_size
+            if aligned_end == 0:
+                return
+            key = self._create_key(
+                token_ids,
+                start=0,
+                end=aligned_end,
+                request_id=request_id,
+                cache_salt=cache_salt,
+            ).no_worker_id_version()
 
         future = send_lmcache_request(
             self.mq_client,
@@ -670,10 +712,11 @@ class LMCacheMPSchedulerAdapter:
 
     def free_lookup_locks(
         self,
-        token_ids: list[int],
-        start: int,
-        end: int,
-        request_id: str,
+        token_ids: list[int] | None = None,
+        block_hashes: list[bytes] | None = None,
+        start: int = 0,
+        end: int = 0,
+        request_id: str = "",
         cache_salt: str = "",
     ) -> None:
         """Release read locks acquired during lookup without a full retrieve.
@@ -690,22 +733,43 @@ class LMCacheMPSchedulerAdapter:
         It is caller's responsibility to properly align the boundaries.
 
         Args:
-            token_ids: Token IDs for the key (same as used in lookup).
-            start: Start token index.
-            end: End token index.
+            token_ids: Token IDs for the key (same as used in lookup, token mode).
+            block_hashes: Block hashes for the key (hash mode).
+                Exactly one of token_ids or block_hashes must be provided.
+            start: Start token index (token mode only).
+            end: End token index (token mode only).
             request_id: The request ID.
             cache_salt: Per-user isolation salt.
         """
         if not self.is_healthy:
             return
 
-        key = self._create_key(
-            token_ids,
-            start=start,
-            end=end,
-            request_id=request_id,
-            cache_salt=cache_salt,
-        ).no_worker_id_version()
+        assert (token_ids is None) != (block_hashes is None), (
+            "Exactly one of token_ids or block_hashes must be provided"
+        )
+
+        if block_hashes is not None:
+            # Hash mode
+            chunk_hashes = tuple(
+                striding_block_hashes(block_hashes, self.blocks_in_chunk)
+            )
+            if not chunk_hashes:
+                return
+            key = self._create_hash_key(
+                chunk_hashes,
+                request_id=request_id,
+                cache_salt=cache_salt,
+            ).no_worker_id_version()
+        else:
+            assert token_ids is not None
+            key = self._create_key(
+                token_ids,
+                start=start,
+                end=end,
+                request_id=request_id,
+                cache_salt=cache_salt,
+            ).no_worker_id_version()
+
         send_lmcache_request(
             self.mq_client,
             RequestType.FREE_LOOKUP_LOCKS,
@@ -781,6 +845,34 @@ class LMCacheMPSchedulerAdapter:
             end=end,
             request_id=request_id,
             cache_salt=cache_salt,
+        )
+
+    def _create_hash_key(
+        self,
+        chunk_hashes: tuple[bytes, ...],
+        request_id: str,
+        cache_salt: str = "",
+    ) -> IPCCacheEngineKey:
+        """Create a hash-mode IPC cache engine key.
+
+        Args:
+            chunk_hashes: Pre-computed chunk hash bytes.
+            request_id: The request ID.
+            cache_salt: Per-user isolation salt.
+
+        Returns:
+            IPCCacheEngineKey: The constructed hash-mode key.
+        """
+        return IPCCacheEngineKey(
+            model_name=self.model_name,
+            world_size=self.world_size,
+            worker_id=None,
+            token_ids=(),
+            start=0,
+            end=0,
+            request_id=request_id,
+            cache_salt=cache_salt,
+            chunk_hashes=chunk_hashes,
         )
 
 
@@ -1079,14 +1171,25 @@ class LMCacheMPWorkerAdapter:
         if not self.is_healthy:
             return
 
-        assert op.token_ids is not None
-        key = self._create_key(
-            op.token_ids,
-            op.start,
-            op.end,
-            request_id=request_id,
-            cache_salt=cache_salt,
-        )
+        if op.block_hashes is not None:
+            # Hash mode
+            chunk_hashes = tuple(
+                striding_block_hashes(op.block_hashes, self.blocks_in_chunk)
+            )
+            key = self._create_hash_key(
+                chunk_hashes,
+                request_id=request_id,
+                cache_salt=cache_salt,
+            )
+        else:
+            assert op.token_ids is not None
+            key = self._create_key(
+                op.token_ids,
+                op.start,
+                op.end,
+                request_id=request_id,
+                cache_salt=cache_salt,
+            )
         if self.transfer_ctx is None:
             raise RuntimeError(
                 "Transfer context is not initialized. "
@@ -1128,14 +1231,25 @@ class LMCacheMPWorkerAdapter:
             self.error_block_ids.update(op.block_ids)
             return
 
-        assert op.token_ids is not None
-        key = self._create_key(
-            op.token_ids,
-            op.start,
-            op.end,
-            request_id=request_id,
-            cache_salt=cache_salt,
-        )
+        if op.block_hashes is not None:
+            # Hash mode
+            chunk_hashes = tuple(
+                striding_block_hashes(op.block_hashes, self.blocks_in_chunk)
+            )
+            key = self._create_hash_key(
+                chunk_hashes,
+                request_id=request_id,
+                cache_salt=cache_salt,
+            )
+        else:
+            assert op.token_ids is not None
+            key = self._create_key(
+                op.token_ids,
+                op.start,
+                op.end,
+                request_id=request_id,
+                cache_salt=cache_salt,
+            )
         if self.transfer_ctx is None:
             raise RuntimeError(
                 "Transfer context is not initialized. "
@@ -1420,4 +1534,32 @@ class LMCacheMPWorkerAdapter:
             end=end,
             request_id=request_id,
             cache_salt=cache_salt,
+        )
+
+    def _create_hash_key(
+        self,
+        chunk_hashes: tuple[bytes, ...],
+        request_id: str,
+        cache_salt: str = "",
+    ) -> IPCCacheEngineKey:
+        """Create a hash-mode IPC cache engine key.
+
+        Args:
+            chunk_hashes: Pre-computed chunk hash bytes.
+            request_id: The request ID.
+            cache_salt: Per-user isolation salt.
+
+        Returns:
+            IPCCacheEngineKey: The constructed hash-mode key.
+        """
+        return IPCCacheEngineKey(
+            model_name=self.model_name,
+            world_size=self.world_size,
+            worker_id=self.worker_id,
+            token_ids=(),
+            start=0,
+            end=0,
+            request_id=request_id,
+            cache_salt=cache_salt,
+            chunk_hashes=chunk_hashes,
         )
